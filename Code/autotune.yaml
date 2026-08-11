@@ -1,0 +1,18 @@
+paths:
+  model: ../model/vit/vit.onnx
+  calibration_data: ../modelopt_hy_learn/model_vit_ptq/output/calib_data.npy
+  output_dir: runs/vit_autotune
+
+quantization:
+  mode: int8
+  calibration_method: max
+  high_precision_dtype: fp16
+
+autotune:
+  schemes_per_region: [15]
+  search_repeats: 1
+  warmup_runs: 10
+  timing_runs: 50
+  pattern_cache: null
+  qdq_baseline: null
+  use_trtexec: false
