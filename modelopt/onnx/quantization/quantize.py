@@ -62,6 +62,7 @@ from modelopt.onnx.quantization.graph_utils import (
     validate_op_types_spelling,
 )
 from modelopt.onnx.quantization.int4 import quantize as quantize_int4
+from modelopt.onnx.quantization.int8 import calibrate_exact_qdq
 from modelopt.onnx.quantization.int8 import quantize as quantize_int8
 from modelopt.onnx.quantization.ort_utils import update_trt_ep_support
 from modelopt.onnx.quantization.qdq_utils import (
@@ -266,7 +267,7 @@ def _preprocess_onnx(
     )
 
 
-def _find_nodes_to_quantize_autotune(
+def _run_autotune(
     onnx_model: onnx.ModelProto,
     quantize_mode: str,
     trt_plugins: list[str] | None,
@@ -283,8 +284,8 @@ def _find_nodes_to_quantize_autotune(
     warmup_runs: int = 50,
     timing_runs: int = 100,
     trtexec_args: str | None = None,
-) -> tuple[list[str], list[str], list[tuple[gs.Node, gs.Node, str]], list[str]]:
-    """Extracts quantization information from Autotune to provide ORT quantization."""
+) -> Any:
+    """Run AutoTune and return the initialized tuner."""
     logger.info("Running Auto Q/DQ with TensorRT")
 
     try:
@@ -311,7 +312,7 @@ def _find_nodes_to_quantize_autotune(
         raise RuntimeError("Failed to initialize TensorRT benchmark")
 
     precision_map = {"fp16": "float16", "fp32": "float32", "bf16": "bfloat16"}
-    autotuner = region_pattern_autotuning_workflow(
+    return region_pattern_autotuning_workflow(
         onnx_model,
         output_dir=Path(output_dir) if output_dir else None,
         num_schemes_per_region=num_schemes_per_region,
@@ -323,7 +324,17 @@ def _find_nodes_to_quantize_autotune(
         node_filter_list=node_filter_list,
         verbose=verbose,
     )
-    return autotuner.get_ort_quantization_config()
+
+
+def _find_nodes_to_quantize_autotune(*args, **kwargs):
+    """Extract the legacy node-level ORT configuration from AutoTune."""
+    return _run_autotune(*args, **kwargs).get_ort_quantization_config()
+
+
+def _find_qdq_model_autotune(*args, **kwargs) -> onnx.ModelProto:
+    """Export AutoTune's exact QDQ graph for in-place calibration."""
+    autotuner = _run_autotune(*args, **kwargs)
+    return onnx.load_from_string(autotuner.export_onnx(best=True))
 
 
 def quantize(
@@ -610,6 +621,9 @@ def quantize(
                 onnx_path, calibration_data, calibration_shapes
             )
 
+    has_manual_qdq_placement = any(
+        [nodes_to_quantize, nodes_to_exclude, op_types_to_quantize, op_types_to_exclude]
+    )
     nodes_to_quantize = nodes_to_quantize or []
     nodes_to_exclude = nodes_to_exclude or []
 
@@ -636,13 +650,25 @@ def quantize(
         calibration_shapes = get_input_shapes(onnx_path)
 
     if quantize_mode in ["fp8", "int8"]:
-        if autotune:
-            (
-                nodes_to_quantize_autotune,
-                op_types_to_quantize_autotune,
-                no_quantize_inputs,
-                op_types_needing_output_quant,
-            ) = _find_nodes_to_quantize_autotune(
+        if autotune and quantize_mode == "int8":
+            if calibrate_per_node:
+                raise ValueError("Per-node calibration is not supported with exact-edge AutoTune")
+            if has_manual_qdq_placement:
+                raise ValueError(
+                    "Manual node/op placement cannot be applied after exact-edge AutoTune; "
+                    "use autotune_node_filter_list to constrain the search"
+                )
+            if dq_only or direct_io_types or custom_ops_to_quantize:
+                raise ValueError(
+                    "dq_only, direct_io_types, and custom-op QDQ rewrites are not supported with "
+                    "exact-edge AutoTune"
+                )
+            if op_types_to_exclude_fp16 or custom_ops_to_cast_fp32:
+                raise ValueError(
+                    "Post-AutoTune precision rewrites are not supported with exact-edge AutoTune; "
+                    "convert the input model before running AutoTune"
+                )
+            exact_qdq_model = _find_qdq_model_autotune(
                 onnx_model,
                 quantize_mode,
                 trt_plugins,
@@ -660,39 +686,75 @@ def quantize(
                 timing_runs=autotune_timing_runs,
                 trtexec_args=autotune_trtexec_args,
             )
-            op_types_to_quantize = op_types_to_quantize or op_types_to_quantize_autotune
-            nodes_to_quantize = nodes_to_quantize or nodes_to_quantize_autotune
-            kwargs["no_quantize_inputs"] = no_quantize_inputs
-            kwargs["op_types_needing_output_quant"] = op_types_needing_output_quant
+            onnx_model = calibrate_exact_qdq(
+                onnx_path=onnx_path,
+                qdq_model=exact_qdq_model,
+                calibration_method=calibration_method or "entropy",
+                calibration_data_reader=calibration_data_reader,
+                calibration_cache_path=calibration_cache_path,
+                calibration_eps=calibration_eps,
+                use_external_data_format=use_external_data_format,
+                trt_extra_plugin_lib_paths=trt_plugins,
+                log_level=log_level,
+            )
+        else:
+            if autotune:
+                (
+                    nodes_to_quantize_autotune,
+                    op_types_to_quantize_autotune,
+                    no_quantize_inputs,
+                    op_types_needing_output_quant,
+                ) = _find_nodes_to_quantize_autotune(
+                    onnx_model,
+                    quantize_mode,
+                    trt_plugins,
+                    high_precision_dtype,
+                    output_dir=autotune_output_dir,
+                    num_schemes_per_region=autotune_num_schemes_per_region,
+                    pattern_cache_file=autotune_pattern_cache_file,
+                    state_file=autotune_state_file,
+                    qdq_baseline_model=autotune_qdq_baseline,
+                    node_filter_list=autotune_node_filter_list,
+                    verbose=autotune_verbose,
+                    use_trtexec=autotune_use_trtexec,
+                    timing_cache_file=autotune_timing_cache,
+                    warmup_runs=autotune_warmup_runs,
+                    timing_runs=autotune_timing_runs,
+                    trtexec_args=autotune_trtexec_args,
+                )
+                op_types_to_quantize = op_types_to_quantize or op_types_to_quantize_autotune
+                nodes_to_quantize = nodes_to_quantize or nodes_to_quantize_autotune
+                kwargs["no_quantize_inputs"] = no_quantize_inputs
+                kwargs["op_types_needing_output_quant"] = op_types_needing_output_quant
 
-        quantize_func = quantize_int8 if quantize_mode == "int8" else quantize_fp8
-        onnx_model = quantize_func(
-            onnx_path=onnx_path,
-            calibration_method=calibration_method or "entropy",
-            calibration_data_reader=calibration_data_reader,
-            calibration_cache_path=calibration_cache_path,
-            calibration_shapes=calibration_shapes,
-            calibration_eps=calibration_eps,
-            op_types_to_quantize=op_types_to_quantize,
-            op_types_to_exclude=op_types_to_exclude,
-            op_types_to_exclude_fp16=op_types_to_exclude_fp16,
-            custom_ops_to_cast_fp32=custom_ops_to_cast_fp32,
-            nodes_to_quantize=nodes_to_quantize,
-            nodes_to_exclude=nodes_to_exclude,
-            use_external_data_format=use_external_data_format,
-            intermediate_generated_files=intermediate_generated_files,
-            trt_extra_plugin_lib_paths=trt_plugins,
-            high_precision_dtype=high_precision_dtype,
-            mha_accumulation_dtype=mha_accumulation_dtype,
-            passes=passes,
-            log_level=log_level,
-            calibrate_per_node=calibrate_per_node,
-            custom_ops_to_quantize=list(custom_ops_to_quantize.keys()),
-            direct_io_types=direct_io_types,
-            opset=opset,
-            autotune=autotune,
-            **kwargs,
-        )
+            quantize_func = quantize_int8 if quantize_mode == "int8" else quantize_fp8
+            onnx_model = quantize_func(
+                onnx_path=onnx_path,
+                calibration_method=calibration_method or "entropy",
+                calibration_data_reader=calibration_data_reader,
+                calibration_cache_path=calibration_cache_path,
+                calibration_shapes=calibration_shapes,
+                calibration_eps=calibration_eps,
+                op_types_to_quantize=op_types_to_quantize,
+                op_types_to_exclude=op_types_to_exclude,
+                op_types_to_exclude_fp16=op_types_to_exclude_fp16,
+                custom_ops_to_cast_fp32=custom_ops_to_cast_fp32,
+                nodes_to_quantize=nodes_to_quantize,
+                nodes_to_exclude=nodes_to_exclude,
+                use_external_data_format=use_external_data_format,
+                intermediate_generated_files=intermediate_generated_files,
+                trt_extra_plugin_lib_paths=trt_plugins,
+                high_precision_dtype=high_precision_dtype,
+                mha_accumulation_dtype=mha_accumulation_dtype,
+                passes=passes,
+                log_level=log_level,
+                calibrate_per_node=calibrate_per_node,
+                custom_ops_to_quantize=list(custom_ops_to_quantize.keys()),
+                direct_io_types=direct_io_types,
+                opset=opset,
+                autotune=autotune,
+                **kwargs,
+            )
 
     elif "int4" in quantize_mode:
         onnx_model = quantize_int4(

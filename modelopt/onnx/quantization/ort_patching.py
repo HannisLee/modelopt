@@ -264,6 +264,27 @@ def _select_tensors_to_calibrate(calibrator, model: onnx.ModelProto):
     tensors_to_calibrate = set()
     tensor_type_to_calibrate = {onnx_pb.TensorProto.FLOAT, onnx_pb.TensorProto.FLOAT16}
 
+    explicit_tensor_names = getattr(calibrator, "explicit_tensor_names_to_calibrate", None)
+    if explicit_tensor_names is not None:
+        missing_tensor_names = set(explicit_tensor_names) - set(value_infos)
+        if missing_tensor_names:
+            raise ValueError(
+                "Could not find calibration tensor metadata for: "
+                f"{sorted(missing_tensor_names)}"
+            )
+
+        for tensor_name in explicit_tensor_names:
+            vi = value_infos[tensor_name]
+            if tensor_name in initializer:
+                raise ValueError(f"Initializer '{tensor_name}' cannot be runtime-calibrated")
+            if not vi.type.HasField("tensor_type") or (
+                vi.type.tensor_type.elem_type not in tensor_type_to_calibrate
+            ):
+                raise ValueError(f"Tensor '{tensor_name}' is not a float tensor")
+            tensors_to_calibrate.add(tensor_name)
+
+        return tensors_to_calibrate, value_infos
+
     for node in model.graph.node:
         # Hack: in calibrator.op_types_to_calibrate we pass nodes_to_quantize
         if node.name in calibrator.op_types_to_calibrate:
@@ -1531,6 +1552,9 @@ def _create_calibrator_with_extra_options(
         )
 
     if calibrator:
+        calibrator.explicit_tensor_names_to_calibrate = extra_options.get(
+            "tensor_names_to_calibrate"
+        )
         calibrator.augment_graph()
         # ======== Modification: additional parameter with TRT plugin path ========
         calibrator.create_inference_session(**extra_options)
@@ -1538,6 +1562,59 @@ def _create_calibrator_with_extra_options(
         return calibrator
 
     raise ValueError(f"Unsupported calibration method {calibrate_method}")
+
+
+def collect_tensor_ranges(
+    model_input: str | Path | onnx.ModelProto,
+    calibration_data_reader: CalibrationDataReader,
+    tensor_names: set[str],
+    calibrate_method=CalibrationMethod.MinMax,
+    use_external_data_format: bool = False,
+    extra_options: dict | None = None,
+) -> TensorsData:
+    """Collect calibration ranges for an explicit set of float tensors."""
+    if not tensor_names:
+        return TensorsData(calibrate_method, {})
+
+    patch_ort_modules(calibrate_per_node=False)
+    options = dict(extra_options or {})
+    options["tensor_names_to_calibrate"] = set(tensor_names)
+
+    with tempfile.TemporaryDirectory(prefix="ort.calib.") as calibration_tmp_dir:
+        if isinstance(model_input, onnx.ModelProto):
+            model_path = Path(calibration_tmp_dir) / "model_input.onnx"
+            onnx.save_model(
+                model_input,
+                model_path,
+                save_as_external_data=True,
+            )
+        else:
+            model_path = Path(model_input)
+
+        calibrator = calibrate.create_calibrator(
+            model_path,
+            [],
+            augmented_model_path=(Path(calibration_tmp_dir) / "augmented_model.onnx").as_posix(),
+            calibrate_method=calibrate_method,
+            use_external_data_format=use_external_data_format,
+            extra_options=options,
+        )
+
+        rewind = getattr(calibration_data_reader, "rewind", None)
+        if callable(rewind):
+            rewind()
+        calibrator.collect_data(calibration_data_reader)
+        tensor_ranges = calibrator.compute_data()
+        del calibrator
+
+    if not isinstance(tensor_ranges, TensorsData):
+        raise TypeError(f"Unexpected calibration result type: {type(tensor_ranges)}")
+
+    missing_ranges = tensor_names - set(tensor_ranges)
+    if missing_ranges:
+        raise ValueError(f"Calibration did not produce ranges for: {sorted(missing_ranges)}")
+
+    return tensor_ranges
 
 
 def _quantize_static(

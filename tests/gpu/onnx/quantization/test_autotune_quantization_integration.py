@@ -26,6 +26,7 @@ from modelopt.onnx.quantization.autotune.workflows import (
     init_benchmark_instance,
     region_pattern_autotuning_workflow,
 )
+from modelopt.onnx.quantization.qdq_calibration import get_qdq_topology
 from modelopt.onnx.quantization.quantize import _preprocess_onnx, quantize
 
 skip_if_no_tensorrt()
@@ -102,6 +103,7 @@ def test_autotune_quantization_integration(tmp_path):
     # Autotune path: export the Q/DQ model directly and collect quantized tensor slots.
     autotune_model = onnx.load_from_string(autotuner.export_onnx(best=True))
     autotune_tensors = _quantized_tensor_indices(autotune_model)
+    autotune_topology = get_qdq_topology(autotune_model)
 
     # MOQ + Autotune path: inject the same autotuner so placement decisions are identical,
     # then run the full quantize() pipeline and collect quantized tensor slots.
@@ -112,12 +114,14 @@ def test_autotune_quantization_integration(tmp_path):
         quantize(onnx_path, autotune=True, output_path=output_path)
 
     # Check Q/DQ nodes placement
-    moq_tensors = _quantized_tensor_indices(onnx.load(output_path))
+    output_model = onnx.load(output_path)
+    moq_tensors = _quantized_tensor_indices(output_model)
     assert autotune_tensors == moq_tensors
+    assert get_qdq_topology(output_model) == autotune_topology
 
     # Check Q/DQ scales
     scales_random = _collect_q_scales(autotune_model)
-    scales_calib = _collect_q_scales(onnx.load(output_path))
+    scales_calib = _collect_q_scales(output_model)
     assert scales_random, "Expected at least one Q scale in the standalone Autotune model"
     assert scales_calib, "Expected at least one Q scale in the MOQ + Autotune integrated model"
     assert len(scales_random.keys()) == len(scales_calib.keys()), (

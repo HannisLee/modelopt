@@ -50,6 +50,7 @@ from modelopt.onnx.quantization.partitioning import (
     find_quantizable_nodes,
     get_skipped_output_layers,
 )
+from modelopt.onnx.quantization.qdq_calibration import calibrate_qdq_model, get_qdq_topology
 from modelopt.onnx.quantization.qdq_utils import has_qdq_nodes, replace_scale_values
 
 
@@ -113,6 +114,65 @@ def _find_nodes_to_quantize(
     logger.info(f"Total number of quantizable nodes: {len(quantizable_nodes)}")
 
     return quantizable_nodes, no_quantize_inputs + no_quantize_kgen_inputs
+
+
+def calibrate_exact_qdq(
+    onnx_path: str,
+    qdq_model: onnx.ModelProto,
+    calibration_method: str = "entropy",
+    calibration_data_reader: CalibrationDataReader | None = None,
+    calibration_cache_path: str | None = None,
+    calibration_eps: list[str] | None = None,
+    use_external_data_format: bool = False,
+    trt_extra_plugin_lib_paths: list[str] | None = None,
+    log_level: str = "INFO",
+) -> onnx.ModelProto:
+    """Calibrate an AutoTune QDQ model without rebuilding its QDQ topology."""
+    configure_logging(level=log_level.upper())
+    if not has_qdq_nodes(qdq_model):
+        logger.info("AutoTune selected no QDQ insertion points")
+        return qdq_model
+    if calibration_data_reader is None and calibration_cache_path is None:
+        raise ValueError("Exact QDQ calibration requires calibration data or a calibration cache")
+
+    source_model = onnx.load(onnx_path, load_external_data=True)
+    source_op_types = {node.op_type for node in source_model.graph.node}
+    calibration_options, _ = configure_ort(
+        list(source_op_types),
+        [],
+        trt_extra_plugin_lib_paths,
+        calibration_eps or ["cpu", "cuda:0", "trt"],
+        calibrate_per_node=False,
+        custom_ops_to_quantize=[],
+        op_types_needing_output_quant=None,
+    )
+    cache_scales = (
+        import_scales_from_calib_cache(calibration_cache_path)
+        if calibration_cache_path
+        else None
+    )
+    method = (
+        CalibrationMethod.Entropy
+        if calibration_method == "entropy"
+        else CalibrationMethod.MinMax
+    )
+
+    topology_before = get_qdq_topology(qdq_model)
+    calibrated_model = calibrate_qdq_model(
+        qdq_model,
+        onnx_path,
+        calibration_data_reader,
+        method,
+        calibration_extra_options=calibration_options,
+        calibration_cache_scales=cache_scales,
+        use_external_data_format=use_external_data_format,
+    )
+
+    if get_qdq_topology(calibrated_model) != topology_before:
+        raise RuntimeError("QDQ topology changed during exact AutoTune finalization")
+
+    onnx.checker.check_model(calibrated_model)
+    return calibrated_model
 
 
 def quantize(
