@@ -71,7 +71,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: unit
-          fail_ci_if_error: true
+          fail_ci_if_error: false
           # Skip GPG/SHASUM integrity check of the Codecov CLI: its key import
           # intermittently fails (codecov/codecov-action#1876), which would
           # otherwise hard-fail this required job on a transient infra blip.
